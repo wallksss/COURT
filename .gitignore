@@ -1,0 +1,13 @@
+.DS_Store
+.venv/
+tmp/
+train.csv
+test.csv
+sample_submission.csv
+template-implementacao/models/*
+!template-implementacao/models/.gitkeep
+template-implementacao/outputs/*
+!template-implementacao/outputs/.gitkeep
+template-implementacao/figs/generated/*
+__pycache__/
+.ipynb_checkpoints/

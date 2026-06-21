@@ -1,0 +1,3 @@
+# Optional NVIDIA-only dependency for 4-bit QLoRA.
+# Install only on Linux/CUDA environments.
+bitsandbytes>=0.43
