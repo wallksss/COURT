@@ -1192,18 +1192,38 @@ def fine_tune_transformer_classifier(
         "fp16": bool(device == "cuda" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported()),
         "bf16": bool(device == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported()),
     }
+    # if device == "cpu":
+    #     args_kwargs["use_cpu"] = True
+    # elif device == "mps":
+    #     args_kwargs["use_mps_device"] = True
+    # try:
+    #     args = TrainingArguments(evaluation_strategy="epoch", **args_kwargs)
+    # except TypeError:
+    #     try:
+    #         args = TrainingArguments(eval_strategy="epoch", **args_kwargs)
+    #     except TypeError:
+    #         args_kwargs.pop("use_mps_device", None)
+    #         args = TrainingArguments(eval_strategy="epoch", **args_kwargs)
+
     if device == "cpu":
-        args_kwargs["no_cuda"] = True
+        args_kwargs["use_cpu"] = True
     elif device == "mps":
         args_kwargs["use_mps_device"] = True
-    try:
-        args = TrainingArguments(evaluation_strategy="epoch", **args_kwargs)
-    except TypeError:
-        try:
-            args = TrainingArguments(eval_strategy="epoch", **args_kwargs)
-        except TypeError:
-            args_kwargs.pop("use_mps_device", None)
-            args = TrainingArguments(eval_strategy="epoch", **args_kwargs)
+
+    # =========================================================================
+    # SOLUÇÃO DEFINITIVA E ROBUSTA CONTRA MUDANÇAS DE VERSÃO DO TRANSFORMERS
+    # =========================================================================
+    # Filtra args_kwargs para conter APENAS parâmetros que a sua versão aceita
+    import inspect
+    valid_params = inspect.signature(TrainingArguments.__init__).parameters
+    filtered_args = {k: v for k, v in args_kwargs.items() if k in valid_params}
+
+    # Trata de forma inteligente a mudança de 'evaluation_strategy' para 'eval_strategy'
+    if "eval_strategy" in valid_params:
+        args = TrainingArguments(eval_strategy="epoch", **filtered_args)
+    else:
+        args = TrainingArguments(evaluation_strategy="epoch", **filtered_args)
+    # =========================================================================
 
     trainer_kwargs = {
         "model": model,
