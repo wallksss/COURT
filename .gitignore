@@ -11,3 +11,5 @@ template-implementacao/outputs/*
 template-implementacao/figs/generated/*
 __pycache__/
 .ipynb_checkpoints/
+*.pdf
+/template-LaTeX
