@@ -15,9 +15,10 @@
 from __future__ import annotations
 
 import inspect
+from itertools import product
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import importlib.util
 import numpy as np
@@ -59,21 +60,21 @@ def build_sparse_model_zoo(random_state: int = 42) -> dict[str, object]:
     def word_tfidf():
         return TfidfVectorizer(
             analyzer="word",
-            ngram_range=(1, 2),
+            ngram_range=(1, 3),
             min_df=2,
             max_df=0.95,
-            max_features=120000,
+            max_features=200000,
             sublinear_tf=True,
             strip_accents="unicode",
         )
 
     def char_tfidf():
         return TfidfVectorizer(
-            analyzer="char_wb",
+            analyzer="char",
             ngram_range=(3, 5),
             min_df=2,
             max_df=0.98,
-            max_features=150000,
+            max_features=200000,
             sublinear_tf=True,
             strip_accents="unicode",
         )
@@ -151,6 +152,23 @@ def build_sparse_model_zoo(random_state: int = 42) -> dict[str, object]:
                 ),
             ]
         ),
+        "linear_svc_calibrated_word_char_union": Pipeline(
+            [
+                (
+                    "features",
+                    FeatureUnion(
+                        [
+                            ("word", word_tfidf()),
+                            ("char", char_tfidf()),
+                        ]
+                    ),
+                ),
+                (
+                    "clf",
+                    _make_calibrated_linear_svc(random_state=random_state),
+                ),
+            ]
+        ),
     }
 
 
@@ -225,6 +243,19 @@ def build_fast_sparse_model_zoo(random_state: int = 42) -> dict[str, object]:
             ]
         ),
     }
+
+
+def _make_calibrated_linear_svc(random_state: int = 42):
+    """Create a probability-capable LinearSVC across scikit-learn versions."""
+
+    from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.svm import LinearSVC
+
+    svc = LinearSVC(C=1.0, class_weight="balanced", random_state=random_state)
+    try:
+        return CalibratedClassifierCV(estimator=svc, cv=3)
+    except TypeError:
+        return CalibratedClassifierCV(base_estimator=svc, cv=3)
 
 
 def evaluate_model_zoo(
@@ -333,6 +364,620 @@ def cross_validate_best_models(
             row[f"{metric}_std"] = values.std()
         rows.append(row)
     return pd.DataFrame(rows).sort_values("f1_macro_mean", ascending=False).reset_index(drop=True)
+
+
+def make_validation_splitters(
+    train_df: pd.DataFrame,
+    config: ExperimentConfig | None = None,
+    text_col: str | None = None,
+) -> dict[str, object]:
+    """Create the three validation schemes requested by the CSV-only plan."""
+
+    _require_sklearn()
+    from sklearn.model_selection import GroupKFold, StratifiedKFold
+
+    config = config or ExperimentConfig()
+    text_col = text_col or config.text_col
+    _validate_modeling_frame(train_df, ExperimentConfig(**{**config.__dict__, "text_col": text_col}))
+
+    y = train_df[config.target_col].astype(int)
+    min_class = int(y.value_counts().min())
+    stratified_splits = min(config.cv_folds, min_class)
+    if stratified_splits < 2:
+        raise ValueError("At least two samples per class are required for stratified CV.")
+
+    n_groups = train_df[text_col].fillna("").astype(str).nunique()
+    group_splits = min(config.cv_folds, int(n_groups))
+    if group_splits < 2:
+        raise ValueError("At least two unique texts are required for GroupKFold.")
+
+    return {
+        "stratified": StratifiedKFold(
+            n_splits=stratified_splits,
+            shuffle=True,
+            random_state=config.random_state,
+        ),
+        "group_by_text": GroupKFold(n_splits=group_splits),
+        "sequential": list(make_sequential_validation_folds(train_df, config=config)),
+    }
+
+
+def make_sequential_validation_folds(
+    train_df: pd.DataFrame,
+    config: ExperimentConfig | None = None,
+    n_splits: int | None = None,
+) -> Iterable[tuple[np.ndarray, np.ndarray]]:
+    """Yield contiguous validation folds after sorting by Id."""
+
+    config = config or ExperimentConfig()
+    if config.id_col not in train_df.columns:
+        raise KeyError(f"Column '{config.id_col}' not found.")
+    _validate_modeling_frame(train_df, config)
+
+    ordered_positions = np.argsort(train_df[config.id_col].to_numpy())
+    fold_count = int(n_splits or config.cv_folds)
+    fold_count = max(2, min(fold_count, len(ordered_positions)))
+    for valid_idx in np.array_split(ordered_positions, fold_count):
+        train_idx = np.setdiff1d(np.arange(len(train_df)), valid_idx, assume_unique=False)
+        yield train_idx, np.asarray(valid_idx)
+
+
+def make_oof_probabilities(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    model,
+    classes: Sequence[int] | None = None,
+    config: ExperimentConfig | None = None,
+    cv_folds: int | None = None,
+    random_state: int | None = None,
+    groups: Sequence[object] | None = None,
+    output_oof_path: str | Path | None = None,
+    output_test_path: str | Path | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Generate leakage-safe out-of-fold and averaged test probabilities."""
+
+    _require_sklearn()
+    from sklearn.base import clone
+    from sklearn.model_selection import GroupKFold, StratifiedKFold
+
+    config = config or ExperimentConfig()
+    if random_state is not None:
+        config = ExperimentConfig(**{**config.__dict__, "random_state": int(random_state)})
+    _validate_modeling_frame(train_df, config)
+    if config.text_col not in test_df.columns:
+        raise KeyError(f"Column '{config.text_col}' not found in test_df.")
+
+    X = train_df[config.text_col].fillna("").astype(str).reset_index(drop=True)
+    y = train_df[config.target_col].astype(int).reset_index(drop=True)
+    X_test = test_df[config.text_col].fillna("").astype(str).reset_index(drop=True)
+    class_values = np.asarray(sorted(classes if classes is not None else y.unique()))
+
+    if groups is None:
+        min_class = int(y.value_counts().min())
+        n_splits = min(int(cv_folds or config.cv_folds), min_class)
+        if n_splits < 2:
+            raise ValueError("At least two samples per class are required for OOF CV.")
+        splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=config.random_state)
+        split_iter = splitter.split(X, y)
+    else:
+        group_values = pd.Series(groups).reset_index(drop=True)
+        n_groups = int(group_values.nunique())
+        n_splits = min(int(cv_folds or config.cv_folds), n_groups)
+        if n_splits < 2:
+            raise ValueError("At least two groups are required for grouped OOF CV.")
+        splitter = GroupKFold(n_splits=n_splits)
+        split_iter = splitter.split(X, y, group_values)
+
+    oof_probs = np.zeros((len(train_df), len(class_values)), dtype=float)
+    test_probs = np.zeros((len(test_df), len(class_values)), dtype=float)
+    fold_count = 0
+    for train_idx, valid_idx in split_iter:
+        estimator = clone(model)
+        estimator.fit(X.iloc[train_idx], y.iloc[train_idx])
+        oof_probs[valid_idx] = _predict_proba_aligned(estimator, X.iloc[valid_idx], class_values)
+        test_probs += _predict_proba_aligned(estimator, X_test, class_values)
+        fold_count += 1
+
+    if fold_count == 0:
+        raise ValueError("No CV folds were produced.")
+    test_probs /= fold_count
+    oof_probs = _normalize_probabilities(oof_probs)
+    test_probs = _normalize_probabilities(test_probs)
+
+    if output_oof_path is not None:
+        output_oof_path = Path(output_oof_path)
+        output_oof_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(output_oof_path, oof_probs)
+    if output_test_path is not None:
+        output_test_path = Path(output_test_path)
+        output_test_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(output_test_path, test_probs)
+    return oof_probs, test_probs
+
+
+def average_probabilities(
+    probability_sets: dict[str, np.ndarray] | Sequence[np.ndarray],
+    weights: dict[str, float] | Sequence[float] | None = None,
+) -> np.ndarray:
+    """Average model probabilities with optional non-negative weights."""
+
+    if isinstance(probability_sets, dict):
+        names = list(probability_sets)
+        arrays = [np.asarray(probability_sets[name], dtype=float) for name in names]
+        if weights is None:
+            weight_values = np.ones(len(names), dtype=float)
+        elif isinstance(weights, dict):
+            weight_values = np.asarray([weights[name] for name in names], dtype=float)
+        else:
+            weight_values = np.asarray(list(weights), dtype=float)
+    else:
+        arrays = [np.asarray(values, dtype=float) for values in probability_sets]
+        weight_values = np.ones(len(arrays), dtype=float) if weights is None else np.asarray(list(weights), dtype=float)
+
+    if not arrays:
+        raise ValueError("At least one probability array is required.")
+    first_shape = arrays[0].shape
+    if any(array.shape != first_shape for array in arrays):
+        raise ValueError("All probability arrays must have the same shape.")
+    if np.any(weight_values < 0):
+        raise ValueError("Ensemble weights must be non-negative.")
+    if not np.isfinite(weight_values).all() or weight_values.sum() <= 0:
+        raise ValueError("Ensemble weights must sum to a positive finite value.")
+
+    weight_values = weight_values / weight_values.sum()
+    combined = np.zeros(first_shape, dtype=float)
+    for weight, values in zip(weight_values, arrays):
+        combined += weight * _normalize_probabilities(values)
+    return _normalize_probabilities(combined)
+
+
+def optimize_ensemble_weights(
+    probability_sets: dict[str, np.ndarray],
+    y_true: Sequence[int],
+    classes: Sequence[int],
+    step: float = 0.05,
+) -> dict[str, object]:
+    """Grid-search convex ensemble weights for macro F1."""
+
+    _require_sklearn()
+    from sklearn.metrics import f1_score
+
+    if step <= 0 or step > 1:
+        raise ValueError("step must be in the interval (0, 1].")
+    names = list(probability_sets)
+    if not names:
+        raise ValueError("probability_sets cannot be empty.")
+
+    units = int(round(1.0 / step))
+    if not np.isclose(units * step, 1.0):
+        raise ValueError("step must evenly divide 1.0, for example 0.05 or 0.10.")
+
+    y_true = np.asarray(y_true).astype(int)
+    class_values = np.asarray(classes).astype(int)
+    best: dict[str, object] | None = None
+    for allocation in product(range(units + 1), repeat=len(names)):
+        if sum(allocation) != units:
+            continue
+        weights = {name: allocation[idx] / units for idx, name in enumerate(names)}
+        combined = average_probabilities(probability_sets, weights=weights)
+        predictions = class_values[np.argmax(combined, axis=1)]
+        score = f1_score(y_true, predictions, average="macro", zero_division=0)
+        if best is None or score > best["f1_macro"]:
+            best = {
+                "weights": weights,
+                "f1_macro": float(score),
+                "probabilities": combined,
+                "predictions": predictions,
+            }
+    if best is None:
+        raise RuntimeError("No ensemble weight combination was evaluated.")
+    return best
+
+
+def duplicate_prior_probabilities(
+    reference_df: pd.DataFrame,
+    target_texts: Iterable[object],
+    classes: Sequence[int],
+    text_col: str = "Body_clean",
+    target_col: str = "Category",
+    alpha: float = 1.0,
+) -> np.ndarray:
+    """Compute smoothed p(label | exact cleaned text) from reference rows only."""
+
+    if alpha < 0:
+        raise ValueError("alpha must be non-negative.")
+    if text_col not in reference_df.columns:
+        raise KeyError(f"Column '{text_col}' not found.")
+    if target_col not in reference_df.columns:
+        raise KeyError(f"Column '{target_col}' not found.")
+
+    class_values = np.asarray(classes).astype(int)
+    class_to_col = {label: idx for idx, label in enumerate(class_values)}
+    uniform = np.ones(len(class_values), dtype=float) / len(class_values)
+    counts_by_text: dict[str, np.ndarray] = {}
+    for text, label in zip(reference_df[text_col].fillna("").astype(str), reference_df[target_col].astype(int)):
+        if label not in class_to_col:
+            continue
+        counts_by_text.setdefault(text, np.zeros(len(class_values), dtype=float))[class_to_col[label]] += 1.0
+
+    rows = []
+    for text in pd.Series(list(target_texts)).fillna("").astype(str):
+        counts = counts_by_text.get(text)
+        if counts is None:
+            rows.append(uniform.copy())
+            continue
+        probs = (counts + alpha) / (counts.sum() + alpha * len(class_values))
+        rows.append(probs)
+    return np.vstack(rows) if rows else np.zeros((0, len(class_values)), dtype=float)
+
+
+def make_oof_duplicate_prior_probabilities(
+    train_df: pd.DataFrame,
+    classes: Sequence[int],
+    config: ExperimentConfig | None = None,
+    cv_folds: int | None = None,
+    groups: Sequence[object] | None = None,
+    alpha: float = 1.0,
+) -> np.ndarray:
+    """Generate duplicate priors for train rows without using their own labels."""
+
+    _require_sklearn()
+    from sklearn.model_selection import GroupKFold, StratifiedKFold
+
+    config = config or ExperimentConfig()
+    _validate_modeling_frame(train_df, config)
+    X = train_df[config.text_col].fillna("").astype(str).reset_index(drop=True)
+    y = train_df[config.target_col].astype(int).reset_index(drop=True)
+    class_values = np.asarray(classes).astype(int)
+    priors = np.zeros((len(train_df), len(class_values)), dtype=float)
+
+    if groups is None:
+        min_class = int(y.value_counts().min())
+        n_splits = min(int(cv_folds or config.cv_folds), min_class)
+        if n_splits < 2:
+            raise ValueError("At least two samples per class are required for OOF duplicate priors.")
+        splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=config.random_state)
+        split_iter = splitter.split(X, y)
+    else:
+        group_values = pd.Series(groups).reset_index(drop=True)
+        n_splits = min(int(cv_folds or config.cv_folds), int(group_values.nunique()))
+        if n_splits < 2:
+            raise ValueError("At least two groups are required for OOF duplicate priors.")
+        splitter = GroupKFold(n_splits=n_splits)
+        split_iter = splitter.split(X, y, group_values)
+
+    for train_idx, valid_idx in split_iter:
+        reference = train_df.iloc[train_idx]
+        priors[valid_idx] = duplicate_prior_probabilities(
+            reference,
+            target_texts=X.iloc[valid_idx],
+            classes=class_values,
+            text_col=config.text_col,
+            target_col=config.target_col,
+            alpha=alpha,
+        )
+    return _normalize_probabilities(priors)
+
+
+def combine_with_duplicate_prior(
+    text_probs: np.ndarray,
+    duplicate_probs: np.ndarray,
+    lambda_dup: float = 1.0,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    """Combine textual probabilities with duplicate priors in log space."""
+
+    text_probs = _normalize_probabilities(np.asarray(text_probs, dtype=float))
+    duplicate_probs = _normalize_probabilities(np.asarray(duplicate_probs, dtype=float))
+    if text_probs.shape != duplicate_probs.shape:
+        raise ValueError("text_probs and duplicate_probs must have the same shape.")
+    log_scores = np.log(text_probs + eps) + float(lambda_dup) * np.log(duplicate_probs + eps)
+    return _softmax(log_scores)
+
+
+def optimize_duplicate_lambda(
+    text_probs: np.ndarray,
+    duplicate_probs: np.ndarray,
+    y_true: Sequence[int],
+    classes: Sequence[int],
+    lambda_grid: Sequence[float] = (0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0),
+) -> dict[str, object]:
+    """Select the duplicate-prior strength that maximizes macro F1."""
+
+    _require_sklearn()
+    from sklearn.metrics import f1_score
+
+    y_true = np.asarray(y_true).astype(int)
+    class_values = np.asarray(classes).astype(int)
+    best = None
+    for lambda_dup in lambda_grid:
+        combined = combine_with_duplicate_prior(text_probs, duplicate_probs, lambda_dup=lambda_dup)
+        predictions = class_values[np.argmax(combined, axis=1)]
+        score = f1_score(y_true, predictions, average="macro", zero_division=0)
+        candidate = {
+            "lambda_dup": float(lambda_dup),
+            "f1_macro": float(score),
+            "probabilities": combined,
+            "predictions": predictions,
+        }
+        if best is None or candidate["f1_macro"] > best["f1_macro"]:
+            best = candidate
+    return best
+
+
+def estimate_transition_matrix(
+    labels: Sequence[int],
+    classes: Sequence[int] | None = None,
+    ids: Sequence[object] | None = None,
+    alpha: float = 1.0,
+    max_id_gap: float | None = None,
+) -> np.ndarray:
+    """Estimate a smoothed transition matrix P(y_i | y_{i-1})."""
+
+    if alpha < 0:
+        raise ValueError("alpha must be non-negative.")
+    labels_array = np.asarray(labels).astype(int)
+    if classes is None:
+        class_values = np.asarray(sorted(np.unique(labels_array))).astype(int)
+    else:
+        class_values = np.asarray(classes).astype(int)
+    class_to_idx = {label: idx for idx, label in enumerate(class_values)}
+
+    if ids is not None:
+        order = np.argsort(np.asarray(ids))
+        labels_array = labels_array[order]
+        ids_array = np.asarray(ids)[order]
+    else:
+        ids_array = None
+
+    counts = np.full((len(class_values), len(class_values)), float(alpha), dtype=float)
+    for pos in range(1, len(labels_array)):
+        if ids_array is not None and max_id_gap is not None:
+            try:
+                if float(ids_array[pos]) - float(ids_array[pos - 1]) > max_id_gap:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        prev_label = labels_array[pos - 1]
+        next_label = labels_array[pos]
+        if prev_label in class_to_idx and next_label in class_to_idx:
+            counts[class_to_idx[prev_label], class_to_idx[next_label]] += 1.0
+    return counts / np.maximum(counts.sum(axis=1, keepdims=True), 1e-12)
+
+
+def sequential_signal_report(
+    train_df: pd.DataFrame,
+    classes: Sequence[int] | None = None,
+    config: ExperimentConfig | None = None,
+) -> dict[str, object]:
+    """Measure how much adjacent Id order agrees with labels."""
+
+    config = config or ExperimentConfig()
+    if config.id_col not in train_df.columns:
+        raise KeyError(f"Column '{config.id_col}' not found.")
+    if config.target_col not in train_df.columns:
+        raise KeyError(f"Column '{config.target_col}' not found.")
+    ordered = train_df.sort_values(config.id_col).reset_index(drop=True)
+    labels = ordered[config.target_col].astype(int).to_numpy()
+    id_diff = ordered[config.id_col].diff().dropna()
+    transition = estimate_transition_matrix(
+        labels,
+        classes=classes,
+        ids=ordered[config.id_col].to_numpy(),
+    )
+    same_next = float((labels[1:] == labels[:-1]).mean()) if len(labels) > 1 else np.nan
+    return {
+        "same_next": same_next,
+        "id_diff_describe": id_diff.describe().to_dict(),
+        "transition_matrix": transition,
+    }
+
+
+def viterbi_decode(
+    emission_probs: np.ndarray,
+    transition_probs: np.ndarray,
+    allowed_label_indices: Sequence[set[int] | None] | None = None,
+    lambda_transition: float = 1.0,
+    start_probs: np.ndarray | None = None,
+    eps: float = 1e-12,
+) -> list[int]:
+    """Decode the best label-index sequence with optional fixed positions."""
+
+    emissions = _normalize_probabilities(np.asarray(emission_probs, dtype=float))
+    transitions = _normalize_probabilities(np.asarray(transition_probs, dtype=float))
+    if emissions.ndim != 2:
+        raise ValueError("emission_probs must be a 2D array.")
+    n_positions, n_classes = emissions.shape
+    if transitions.shape != (n_classes, n_classes):
+        raise ValueError("transition_probs must have shape (n_classes, n_classes).")
+    if allowed_label_indices is not None and len(allowed_label_indices) != n_positions:
+        raise ValueError("allowed_label_indices length must match emission rows.")
+
+    log_emissions = np.log(emissions + eps)
+    log_transitions = np.log(transitions + eps) * float(lambda_transition)
+    if start_probs is None:
+        log_start = np.full(n_classes, -np.log(n_classes), dtype=float)
+    else:
+        log_start = np.log(_normalize_probabilities(np.asarray(start_probs, dtype=float).reshape(1, -1))[0] + eps)
+
+    dp = np.full((n_positions, n_classes), -np.inf, dtype=float)
+    back = np.zeros((n_positions, n_classes), dtype=int)
+    dp[0] = log_start + log_emissions[0] + _allowed_mask(n_classes, None if allowed_label_indices is None else allowed_label_indices[0])
+    for pos in range(1, n_positions):
+        mask = _allowed_mask(n_classes, None if allowed_label_indices is None else allowed_label_indices[pos])
+        scores = dp[pos - 1][:, None] + log_transitions
+        back[pos] = np.argmax(scores, axis=0)
+        dp[pos] = scores[back[pos], np.arange(n_classes)] + log_emissions[pos] + mask
+
+    decoded = [int(np.argmax(dp[-1]))]
+    for pos in range(n_positions - 1, 0, -1):
+        decoded.append(int(back[pos, decoded[-1]]))
+    decoded.reverse()
+    return decoded
+
+
+def transductive_viterbi_submission(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    test_probs: np.ndarray,
+    classes: Sequence[int],
+    config: ExperimentConfig | None = None,
+    transition_probs: np.ndarray | None = None,
+    lambda_transition: float = 1.0,
+    output_path: str | Path | None = None,
+) -> pd.DataFrame:
+    """Infer test labels in Id order while keeping training labels fixed."""
+
+    config = config or ExperimentConfig()
+    for frame_name, frame in [("train_df", train_df), ("test_df", test_df)]:
+        if config.id_col not in frame.columns:
+            raise KeyError(f"Column '{config.id_col}' not found in {frame_name}.")
+    if config.target_col not in train_df.columns:
+        raise KeyError(f"Column '{config.target_col}' not found in train_df.")
+
+    class_values = np.asarray(classes).astype(int)
+    class_to_idx = {label: idx for idx, label in enumerate(class_values)}
+    test_probs = _normalize_probabilities(np.asarray(test_probs, dtype=float))
+    if test_probs.shape != (len(test_df), len(class_values)):
+        raise ValueError("test_probs shape must be (len(test_df), n_classes).")
+
+    if transition_probs is None:
+        transition_probs = estimate_transition_matrix(
+            train_df[config.target_col].astype(int),
+            classes=class_values,
+            ids=train_df[config.id_col],
+        )
+
+    train_part = pd.DataFrame(
+        {
+            config.id_col: train_df[config.id_col].to_numpy(),
+            "_source": "train",
+            "_row": np.arange(len(train_df)),
+        }
+    )
+    test_part = pd.DataFrame(
+        {
+            config.id_col: test_df[config.id_col].to_numpy(),
+            "_source": "test",
+            "_row": np.arange(len(test_df)),
+        }
+    )
+    all_data = pd.concat([train_part, test_part], ignore_index=True).sort_values(config.id_col).reset_index(drop=True)
+
+    emissions = np.full((len(all_data), len(class_values)), 1.0 / len(class_values), dtype=float)
+    allowed: list[set[int] | None] = []
+    train_labels = train_df[config.target_col].astype(int).reset_index(drop=True)
+    for pos, row in all_data.iterrows():
+        if row["_source"] == "train":
+            label = int(train_labels.iloc[int(row["_row"])])
+            if label not in class_to_idx:
+                raise ValueError(f"Training label {label} is not present in classes.")
+            allowed.append({class_to_idx[label]})
+        else:
+            emissions[pos] = test_probs[int(row["_row"])]
+            allowed.append(None)
+
+    decoded_indices = viterbi_decode(
+        emissions,
+        transition_probs,
+        allowed_label_indices=allowed,
+        lambda_transition=lambda_transition,
+    )
+    all_data["Category"] = class_values[np.asarray(decoded_indices)].astype(int)
+    submission = (
+        all_data.loc[all_data["_source"] == "test", [config.id_col, "Category"]]
+        .sort_values(config.id_col)
+        .reset_index(drop=True)
+    )
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        submission.to_csv(output_path, index=False)
+    return submission
+
+
+def optimize_transition_lambda_oof(
+    train_df: pd.DataFrame,
+    emission_probs: np.ndarray,
+    classes: Sequence[int],
+    config: ExperimentConfig | None = None,
+    lambda_grid: Sequence[float] = (0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0),
+    alpha_transition: float = 1.0,
+    folds: Iterable[tuple[np.ndarray, np.ndarray]] | None = None,
+) -> dict[str, object]:
+    """Validate transductive Viterbi by hiding labels inside train folds."""
+
+    _require_sklearn()
+    from sklearn.metrics import f1_score
+
+    config = config or ExperimentConfig()
+    _validate_modeling_frame(train_df, config)
+    if config.id_col not in train_df.columns:
+        raise KeyError(f"Column '{config.id_col}' not found.")
+
+    class_values = np.asarray(classes).astype(int)
+    class_to_idx = {label: idx for idx, label in enumerate(class_values)}
+    emissions = _normalize_probabilities(np.asarray(emission_probs, dtype=float))
+    if emissions.shape != (len(train_df), len(class_values)):
+        raise ValueError("emission_probs shape must be (len(train_df), n_classes).")
+
+    fold_list = list(folds) if folds is not None else list(make_sequential_validation_folds(train_df, config=config))
+    y_true = train_df[config.target_col].astype(int).to_numpy()
+    ordered = train_df[[config.id_col, config.target_col]].copy()
+    ordered["_position"] = np.arange(len(train_df))
+    ordered = ordered.sort_values(config.id_col).reset_index(drop=True)
+    ordered_positions = ordered["_position"].to_numpy().astype(int)
+
+    best = None
+    for lambda_transition in lambda_grid:
+        predictions = np.full(len(train_df), fill_value=class_values[0], dtype=int)
+        evaluated_mask = np.zeros(len(train_df), dtype=bool)
+        for train_idx, valid_idx in fold_list:
+            known_positions = set(np.asarray(train_idx).astype(int).tolist())
+            hidden_positions = set(np.asarray(valid_idx).astype(int).tolist())
+            known_df = train_df.iloc[list(known_positions)]
+            transition = estimate_transition_matrix(
+                known_df[config.target_col].astype(int),
+                classes=class_values,
+                ids=known_df[config.id_col],
+                alpha=alpha_transition,
+            )
+
+            sequence_emissions = np.full((len(train_df), len(class_values)), 1.0 / len(class_values), dtype=float)
+            allowed: list[set[int] | None] = []
+            for position in ordered_positions:
+                if position in hidden_positions:
+                    sequence_emissions[len(allowed)] = emissions[position]
+                    allowed.append(None)
+                elif position in known_positions:
+                    label = int(y_true[position])
+                    allowed.append({class_to_idx[label]})
+                else:
+                    label = int(y_true[position])
+                    allowed.append({class_to_idx[label]})
+
+            decoded_indices = viterbi_decode(
+                sequence_emissions,
+                transition,
+                allowed_label_indices=allowed,
+                lambda_transition=lambda_transition,
+            )
+            decoded_labels_ordered = class_values[np.asarray(decoded_indices)].astype(int)
+            for ordered_idx, position in enumerate(ordered_positions):
+                if position in hidden_positions:
+                    predictions[position] = decoded_labels_ordered[ordered_idx]
+                    evaluated_mask[position] = True
+
+        score = f1_score(y_true[evaluated_mask], predictions[evaluated_mask], average="macro", zero_division=0)
+        candidate = {
+            "lambda_transition": float(lambda_transition),
+            "f1_macro": float(score),
+            "predictions": predictions,
+            "evaluated_mask": evaluated_mask,
+        }
+        if best is None or candidate["f1_macro"] > best["f1_macro"]:
+            best = candidate
+    return best
 
 
 def fit_model_on_full_train(
@@ -1037,6 +1682,73 @@ def _instantiate_trainer_compat(trainer_cls, trainer_kwargs: dict[str, object], 
     return trainer
 
 
+def build_label_mappings(labels: Sequence[int]) -> tuple[list[int], dict[int, int], dict[int, int]]:
+    """Build explicit label mappings for arbitrary integer class values."""
+
+    label_values = sorted(pd.Series(labels).dropna().astype(int).unique().tolist())
+    label2id = {label: idx for idx, label in enumerate(label_values)}
+    id2label = {idx: label for label, idx in label2id.items()}
+    return label_values, label2id, id2label
+
+
+def tokenize_head_tail_text(
+    text: object,
+    tokenizer,
+    max_length: int = 512,
+    head_tokens: int = 384,
+    tail_tokens: int = 128,
+) -> dict[str, list[int]]:
+    """Tokenize one document with first-token plus last-token truncation."""
+
+    if max_length <= 0:
+        raise ValueError("max_length must be positive.")
+    if head_tokens < 0 or tail_tokens < 0:
+        raise ValueError("head_tokens and tail_tokens must be non-negative.")
+
+    encoded = tokenizer(str(text or ""), add_special_tokens=False, truncation=False)
+    input_ids = list(encoded["input_ids"])
+    try:
+        special_count = int(tokenizer.num_special_tokens_to_add(pair=False))
+    except AttributeError:
+        special_count = 2
+    content_length = max(max_length - special_count, 1)
+    if len(input_ids) > content_length:
+        tail_count = min(tail_tokens, content_length)
+        head_count = min(head_tokens, content_length - tail_count)
+        remaining = content_length - head_count - tail_count
+        head_count += remaining
+        input_ids = input_ids[:head_count] + (input_ids[-tail_count:] if tail_count else [])
+
+    return tokenizer.prepare_for_model(
+        input_ids,
+        truncation=False,
+        max_length=max_length,
+    )
+
+
+def tokenize_head_tail_batch(
+    texts: Iterable[object],
+    tokenizer,
+    max_length: int = 512,
+    head_tokens: int = 384,
+    tail_tokens: int = 128,
+) -> dict[str, list[list[int]]]:
+    """Tokenize a batch using head+tail truncation without padding."""
+
+    encoded_rows = [
+        tokenize_head_tail_text(
+            text,
+            tokenizer,
+            max_length=max_length,
+            head_tokens=head_tokens,
+            tail_tokens=tail_tokens,
+        )
+        for text in texts
+    ]
+    keys = sorted({key for row in encoded_rows for key in row})
+    return {key: [row.get(key, []) for row in encoded_rows] for key in keys}
+
+
 def fine_tune_transformer_classifier(
     train_df: pd.DataFrame,
     model_name: str = "neuralmind/bert-base-portuguese-cased",
@@ -1084,6 +1796,8 @@ def fine_tune_transformer_classifier(
     device = device or gpu_environment_report().get("preferred_device", "cpu")
 
     data = train_df[[config.text_col, config.target_col]].rename(columns={config.text_col: "text", config.target_col: "label"})
+    label_values, label2id, id2label = build_label_mappings(data["label"])
+    data["label"] = data["label"].map(label2id).astype(int)
     train_split, valid_split = train_test_split(
         data,
         test_size=config.validation_size,
@@ -1093,9 +1807,9 @@ def fine_tune_transformer_classifier(
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     model_kwargs = {
-        "num_labels": 5,
-        "id2label": {idx: str(idx) for idx in range(5)},
-        "label2id": {str(idx): idx for idx in range(5)},
+        "num_labels": len(label_values),
+        "id2label": {idx: str(label) for idx, label in id2label.items()},
+        "label2id": {str(label): idx for label, idx in label2id.items()},
     }
     if quantization_4bit:
         if not torch.cuda.is_available():
@@ -1135,7 +1849,7 @@ def fine_tune_transformer_classifier(
         model.to(torch.device(device))
 
     def tokenize(batch):
-        return tokenizer(batch["text"], truncation=True, max_length=max_length)
+        return tokenize_head_tail_batch(batch["text"], tokenizer, max_length=max_length)
 
     train_dataset = Dataset.from_pandas(train_split.reset_index(drop=True)).map(tokenize, batched=True)
     valid_dataset = Dataset.from_pandas(valid_split.reset_index(drop=True)).map(tokenize, batched=True)
@@ -1173,7 +1887,7 @@ def fine_tune_transformer_classifier(
     if use_class_weights:
         counts = train_split["label"].value_counts().sort_index()
         weights = counts.sum() / (len(counts) * counts)
-        class_weights = torch.tensor([weights.get(idx, 1.0) for idx in range(5)], dtype=torch.float)
+        class_weights = torch.tensor([weights.get(idx, 1.0) for idx in range(len(label_values))], dtype=torch.float)
 
     args_kwargs = {
         "output_dir": output_dir,
@@ -1278,11 +1992,17 @@ def generate_transformer_submission(
     dataset = Dataset.from_pandas(test_df[[id_col, text_col]].rename(columns={text_col: "text"}).reset_index(drop=True))
 
     def tokenize(batch):
-        return tokenizer(batch["text"], truncation=True, max_length=max_length)
+        return tokenize_head_tail_batch(batch["text"], tokenizer, max_length=max_length)
 
     tokenized = dataset.map(tokenize, batched=True)
     predictions = trainer.predict(tokenized)
-    labels = np.argmax(predictions.predictions, axis=-1).astype(int)
+    predicted_ids = np.argmax(predictions.predictions, axis=-1).astype(int)
+    id2label = getattr(getattr(trainer, "model", None), "config", None)
+    id2label = getattr(id2label, "id2label", None) if id2label is not None else None
+    if id2label:
+        labels = np.asarray([int(id2label.get(int(idx), id2label.get(str(idx), idx))) for idx in predicted_ids], dtype=int)
+    else:
+        labels = predicted_ids
     submission = pd.DataFrame({"Id": test_df[id_col].values, "Category": labels})
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1303,6 +2023,71 @@ def _require_sklearn() -> None:
         import sklearn  # noqa: F401
     except ImportError as exc:
         raise ImportError("Install scikit-learn to run experiments.") from exc
+
+
+def _predict_proba_aligned(model, texts: Iterable[str], classes: np.ndarray) -> np.ndarray:
+    """Return probabilities with columns ordered exactly as ``classes``."""
+
+    if hasattr(model, "predict_proba"):
+        raw_scores = np.asarray(model.predict_proba(texts), dtype=float)
+        model_classes = np.asarray(getattr(model, "classes_", classes)).astype(int)
+        probabilities = raw_scores
+    elif hasattr(model, "decision_function"):
+        raw_scores = np.asarray(model.decision_function(texts), dtype=float)
+        if raw_scores.ndim == 1:
+            raw_scores = np.column_stack([-raw_scores, raw_scores])
+        model_classes = np.asarray(getattr(model, "classes_", classes[: raw_scores.shape[1]])).astype(int)
+        probabilities = _softmax(raw_scores)
+    else:
+        predictions = np.asarray(model.predict(texts)).astype(int)
+        model_classes = classes.astype(int)
+        probabilities = np.zeros((len(predictions), len(model_classes)), dtype=float)
+        for row_idx, label in enumerate(predictions):
+            matches = np.where(model_classes == label)[0]
+            if len(matches):
+                probabilities[row_idx, matches[0]] = 1.0
+
+    aligned = np.zeros((probabilities.shape[0], len(classes)), dtype=float)
+    class_to_col = {int(label): idx for idx, label in enumerate(classes.astype(int))}
+    for source_idx, label in enumerate(model_classes):
+        target_idx = class_to_col.get(int(label))
+        if target_idx is not None and source_idx < probabilities.shape[1]:
+            aligned[:, target_idx] = probabilities[:, source_idx]
+    return _normalize_probabilities(aligned)
+
+
+def _normalize_probabilities(probabilities: np.ndarray) -> np.ndarray:
+    """Normalize rows, replacing all-zero rows with a uniform distribution."""
+
+    values = np.asarray(probabilities, dtype=float)
+    if values.ndim == 1:
+        total = values.sum()
+        if total <= 0 or not np.isfinite(total):
+            return np.ones_like(values, dtype=float) / len(values)
+        return values / total
+    if values.ndim != 2:
+        raise ValueError("probabilities must be a 1D or 2D array.")
+    values = np.where(np.isfinite(values) & (values > 0), values, 0.0)
+    row_sums = values.sum(axis=1, keepdims=True)
+    zero_rows = row_sums[:, 0] <= 0
+    if np.any(zero_rows):
+        values[zero_rows] = 1.0 / values.shape[1]
+        row_sums = values.sum(axis=1, keepdims=True)
+    return values / np.maximum(row_sums, 1e-12)
+
+
+def _allowed_mask(n_classes: int, allowed: set[int] | None) -> np.ndarray:
+    """Create an additive log-space mask for allowed label indices."""
+
+    mask = np.zeros(n_classes, dtype=float)
+    if allowed is None:
+        return mask
+    mask[:] = -np.inf
+    for idx in allowed:
+        if idx < 0 or idx >= n_classes:
+            raise ValueError(f"Allowed label index {idx} is outside 0..{n_classes - 1}.")
+        mask[idx] = 0.0
+    return mask
 
 
 def _softmax(scores: np.ndarray) -> np.ndarray:

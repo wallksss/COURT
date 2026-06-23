@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -125,9 +126,51 @@ def save_results_table(results_df: pd.DataFrame, output_path: str | Path = "outp
     return output_path
 
 
+def save_experiment_report(
+    results_df: pd.DataFrame,
+    output_dir: str | Path = "outputs",
+    filename_stem: str = "results",
+    metric: str = "f1_macro",
+) -> dict[str, Path]:
+    """Save experiment metrics as CSV, JSON and Markdown."""
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ranked = rank_results(results_df, metric=metric)
+    csv_path = output_dir / f"{filename_stem}.csv"
+    json_path = output_dir / f"{filename_stem}.json"
+    md_path = output_dir / f"{filename_stem}.md"
+
+    ranked.to_csv(csv_path, index=False)
+    json_path.write_text(
+        json.dumps(ranked.replace({np.nan: None}).to_dict(orient="records"), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    md_path.write_text(_results_markdown_table(ranked), encoding="utf-8")
+    return {"csv": csv_path, "json": json_path, "markdown": md_path}
+
+
 def compare_with_cv(holdout_df: pd.DataFrame, cv_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """Merge holdout and cross-validation summaries when both are available."""
 
     if cv_df is None or cv_df.empty:
         return holdout_df.copy()
     return holdout_df.merge(cv_df, on="model", how="left", suffixes=("_holdout", "_cv"))
+
+
+def _results_markdown_table(results_df: pd.DataFrame) -> str:
+    cols = [col for col in ["model", "f1_macro", "f1_weighted", "accuracy", "error"] if col in results_df.columns]
+    table = results_df[cols].copy()
+    if table.empty:
+        return "# Results\n\nNo results available.\n"
+    lines = ["# Results", "", "| " + " | ".join(cols) + " |", "| " + " | ".join(["---"] * len(cols)) + " |"]
+    for _, row in table.iterrows():
+        values = []
+        for col in cols:
+            value = row[col]
+            if isinstance(value, float):
+                values.append(f"{value:.6f}")
+            else:
+                values.append(str(value))
+        lines.append("| " + " | ".join(values) + " |")
+    return "\n".join(lines) + "\n"

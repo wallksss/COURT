@@ -179,6 +179,86 @@ def summarize_dataset(train_df: pd.DataFrame, text_col: str = "Body", target_col
     }
 
 
+def text_length_percentiles(
+    df: pd.DataFrame,
+    text_col: str = "Body",
+    percentiles: tuple[float, ...] = (0.5, 0.9, 0.95, 0.99),
+) -> dict[str, float]:
+    """Summarize text length for deciding between 512-token and long models."""
+
+    if text_col not in df.columns:
+        raise KeyError(f"Column '{text_col}' not found.")
+    n_words = df[text_col].fillna("").astype(str).str.split().str.len()
+    summary = {
+        "mean": float(n_words.mean()),
+        "median": float(n_words.median()),
+        "max": float(n_words.max()),
+    }
+    for percentile in percentiles:
+        summary[f"p{int(percentile * 100)}"] = float(n_words.quantile(percentile))
+    return summary
+
+
+def duplicate_text_report(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame | None = None,
+    text_col: str = "Body_clean",
+    target_col: str = "Category",
+) -> dict[str, object]:
+    """Analyze exact duplicate texts and train/test text overlap."""
+
+    if text_col not in train_df.columns:
+        raise KeyError(f"Column '{text_col}' not found in train_df.")
+    if target_col not in train_df.columns:
+        raise KeyError(f"Column '{target_col}' not found in train_df.")
+
+    train_text = train_df[text_col].fillna("").astype(str)
+    train_work = train_df.copy()
+    train_work[text_col] = train_text
+    text_counts = train_text.value_counts().rename("count")
+    duplicate_counts = text_counts[text_counts > 1].rename_axis(text_col).reset_index()
+
+    label_nunique = train_work.groupby(text_col)[target_col].nunique().rename("n_labels")
+    label_counts = (
+        train_work.groupby([text_col, target_col])
+        .size()
+        .rename("label_count")
+        .reset_index()
+        .sort_values([text_col, "label_count"], ascending=[True, False])
+    )
+    conflicting_texts = label_nunique[label_nunique > 1].rename_axis(text_col).reset_index()
+    same_label_duplicate_texts = label_nunique[(label_nunique == 1) & (text_counts > 1)].rename_axis(text_col).reset_index()
+
+    test_overlap = pd.DataFrame(columns=[text_col])
+    n_test_rows_seen = 0
+    if test_df is not None:
+        if text_col not in test_df.columns:
+            raise KeyError(f"Column '{text_col}' not found in test_df.")
+        seen_texts = set(train_text)
+        test_text = test_df[text_col].fillna("").astype(str)
+        overlap_mask = test_text.isin(seen_texts)
+        n_test_rows_seen = int(overlap_mask.sum())
+        test_overlap = test_df.loc[overlap_mask].copy()
+
+    summary = {
+        "n_train_rows": int(len(train_df)),
+        "n_unique_texts": int(train_text.nunique()),
+        "n_duplicate_rows": int(len(train_df) - train_text.nunique()),
+        "n_duplicate_texts": int(len(duplicate_counts)),
+        "n_conflicting_texts": int(len(conflicting_texts)),
+        "n_same_label_duplicate_texts": int(len(same_label_duplicate_texts)),
+        "n_test_rows_seen_in_train": n_test_rows_seen,
+    }
+    return {
+        "summary": summary,
+        "duplicate_counts": duplicate_counts,
+        "label_counts_by_text": label_counts,
+        "conflicting_texts": conflicting_texts,
+        "same_label_duplicate_texts": same_label_duplicate_texts,
+        "test_overlap": test_overlap,
+    }
+
+
 def get_top_terms(
     df: pd.DataFrame,
     text_col: str = "Body",

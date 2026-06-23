@@ -9,7 +9,184 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from scripts import experimentos  # noqa: E402
+from scripts import analise_exploratoria, experimentos, preprocessamento  # noqa: E402
+
+
+class CleaningTests(unittest.TestCase):
+    def test_clean_body_fixes_mojibake_wrapper_and_preserves_legal_tokens(self):
+        cleaned = preprocessamento.clean_body('{"conclusÃ£o   ARTIGO_102\nEMAIL"}')
+
+        self.assertEqual(cleaned, "conclus\u00e3o ARTIGO_102 EMAIL")
+
+
+class DuplicateAndEnsembleTests(unittest.TestCase):
+    def test_duplicate_text_report_counts_conflicts_and_test_overlap(self):
+        train = pd.DataFrame(
+            {
+                "Body_clean": ["a", "a", "b", "b", "c"],
+                "Category": [0, 0, 1, 2, 2],
+            }
+        )
+        test = pd.DataFrame({"Body_clean": ["a", "x"]})
+
+        report = analise_exploratoria.duplicate_text_report(train, test, text_col="Body_clean")
+
+        self.assertEqual(report["summary"]["n_unique_texts"], 3)
+        self.assertEqual(report["summary"]["n_duplicate_rows"], 2)
+        self.assertEqual(report["summary"]["n_conflicting_texts"], 1)
+        self.assertEqual(report["summary"]["n_same_label_duplicate_texts"], 1)
+        self.assertEqual(report["summary"]["n_test_rows_seen_in_train"], 1)
+
+    def test_duplicate_prior_uses_reference_counts_with_smoothing(self):
+        reference = pd.DataFrame(
+            {
+                "Body_clean": ["texto a", "texto a", "texto b"],
+                "Category": [0, 0, 1],
+            }
+        )
+
+        probs = experimentos.duplicate_prior_probabilities(
+            reference,
+            target_texts=["texto a", "texto novo"],
+            classes=[0, 1, 2],
+            alpha=1.0,
+        )
+
+        np.testing.assert_allclose(probs[0], np.array([3 / 5, 1 / 5, 1 / 5]))
+        np.testing.assert_allclose(probs[1], np.array([1 / 3, 1 / 3, 1 / 3]))
+
+    def test_duplicate_prior_combines_with_text_probs_in_log_space(self):
+        text_probs = np.array([[0.40, 0.60]])
+        duplicate_probs = np.array([[0.90, 0.10]])
+
+        combined = experimentos.combine_with_duplicate_prior(
+            text_probs,
+            duplicate_probs,
+            lambda_dup=2.0,
+        )
+
+        self.assertEqual(combined.argmax(axis=1).tolist(), [0])
+        np.testing.assert_allclose(combined.sum(axis=1), np.array([1.0]))
+
+    def test_optimize_ensemble_weights_selects_informative_model(self):
+        y_true = np.array([0, 1, 1, 0])
+        good = np.array(
+            [
+                [0.95, 0.05],
+                [0.05, 0.95],
+                [0.10, 0.90],
+                [0.90, 0.10],
+            ]
+        )
+        bad = good[:, ::-1]
+
+        result = experimentos.optimize_ensemble_weights(
+            {"good": good, "bad": bad},
+            y_true,
+            classes=[0, 1],
+            step=0.5,
+        )
+
+        self.assertEqual(result["weights"]["good"], 1.0)
+        self.assertEqual(result["weights"]["bad"], 0.0)
+        self.assertEqual(result["f1_macro"], 1.0)
+
+
+class OutOfFoldTests(unittest.TestCase):
+    def test_make_oof_probabilities_aligns_columns_and_test_shape(self):
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.pipeline import Pipeline
+
+        train = pd.DataFrame(
+            {
+                "Body_clean": [
+                    "acordao turma alfa",
+                    "acordao pleno alfa",
+                    "recurso extraordinario beta",
+                    "recurso beta geral",
+                    "sentenca juiz gama",
+                    "sentenca procedente gama",
+                ],
+                "Category": [0, 0, 1, 1, 2, 2],
+            }
+        )
+        test = pd.DataFrame({"Body_clean": ["alfa", "beta", "gama"]})
+        model = Pipeline(
+            [
+                ("tfidf", TfidfVectorizer()),
+                ("clf", LogisticRegression(max_iter=500, random_state=0)),
+            ]
+        )
+
+        oof, test_probs = experimentos.make_oof_probabilities(
+            train,
+            test,
+            model,
+            classes=[0, 1, 2],
+            cv_folds=2,
+            random_state=0,
+        )
+
+        self.assertEqual(oof.shape, (6, 3))
+        self.assertEqual(test_probs.shape, (3, 3))
+        np.testing.assert_allclose(oof.sum(axis=1), np.ones(6))
+        np.testing.assert_allclose(test_probs.sum(axis=1), np.ones(3))
+
+
+class TransformerTokenizationTests(unittest.TestCase):
+    def test_head_tail_tokenization_keeps_beginning_and_ending_tokens(self):
+        class FakeTokenizer:
+            cls_token_id = 101
+            sep_token_id = 102
+
+            def __call__(self, text, add_special_tokens=False, truncation=False):
+                ids = [int(token[1:]) for token in text.split()]
+                if add_special_tokens:
+                    ids = [self.cls_token_id, *ids, self.sep_token_id]
+                return {"input_ids": ids}
+
+            def num_special_tokens_to_add(self, pair=False):
+                return 2
+
+            def prepare_for_model(self, input_ids, truncation=False, max_length=None):
+                ids = [self.cls_token_id, *input_ids, self.sep_token_id]
+                return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+
+        encoded = experimentos.tokenize_head_tail_text(
+            " ".join(f"t{i}" for i in range(10)),
+            FakeTokenizer(),
+            max_length=8,
+            head_tokens=4,
+            tail_tokens=2,
+        )
+
+        self.assertEqual(encoded["input_ids"], [101, 0, 1, 2, 3, 8, 9, 102])
+
+
+class SequentialViterbiTests(unittest.TestCase):
+    def test_viterbi_keeps_known_labels_fixed(self):
+        emission_probs = np.array(
+            [
+                [0.90, 0.10],
+                [0.99, 0.01],
+                [0.55, 0.45],
+            ]
+        )
+        transition_probs = np.array(
+            [
+                [0.80, 0.20],
+                [0.20, 0.80],
+            ]
+        )
+
+        decoded = experimentos.viterbi_decode(
+            emission_probs,
+            transition_probs,
+            allowed_label_indices=[None, {1}, None],
+        )
+
+        self.assertEqual(decoded[1], 1)
 
 
 class TrainerCompatibilityTests(unittest.TestCase):
