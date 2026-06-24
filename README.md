@@ -114,7 +114,9 @@ The notebook now includes an explicit CSV-only competition path:
 - `outputs/oof_ensemble.npy`, `outputs/test_ensemble.npy`, `outputs/oof_ensemble_duplicate.npy`, and `outputs/test_ensemble_duplicate.npy` store the ensemble stages.
 - `outputs/submission_sota_csv_viterbi.csv` is the final Viterbi/HMM-style submission using test emissions plus train labels fixed in `Id` order.
 
-The validation code avoids deliberate leakage: duplicate priors for training rows are built out-of-fold, and the sequential Viterbi lambda is selected by hiding labels inside the training set.
+The validation code avoids deliberate leakage: duplicate priors for training rows are built out-of-fold, and the sequential Viterbi lambda is selected by hiding labels inside the training set. After those choices are made, test probabilities are generated with a final refit on all labeled training rows by default.
+
+For Transformer experiments, the default legal-domain checkpoint is `rufimelo/Legal-BERTimbau-sts-base-ma-v2`. On a 12GB GPU, start with this base model; `rufimelo/Legal-BERTimbau-sts-large-ma-v3` is listed as a stronger but tighter option that should use smaller batches.
 
 ## Notes On Sensitive Data
 

@@ -9,7 +9,7 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from scripts import analise_exploratoria, experimentos, preprocessamento  # noqa: E402
+from scripts import analise_exploratoria, experimentos, notebook_support, preprocessamento  # noqa: E402
 
 
 class CleaningTests(unittest.TestCase):
@@ -17,6 +17,29 @@ class CleaningTests(unittest.TestCase):
         cleaned = preprocessamento.clean_body('{"conclusÃ£o   ARTIGO_102\nEMAIL"}')
 
         self.assertEqual(cleaned, "conclus\u00e3o ARTIGO_102 EMAIL")
+
+    def test_cached_preprocessed_data_reuses_existing_csvs(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "data").mkdir()
+            (project / "outputs").mkdir()
+            pd.DataFrame(
+                {
+                    "Id": [1, 2],
+                    "Body": ["conclusÃ£o", "sentenca"],
+                    "Category": [0, -1],
+                }
+            ).to_csv(project / "data" / "train.csv", index=False)
+            pd.DataFrame({"Id": [3], "Body": ["teste"]}).to_csv(project / "data" / "test.csv", index=False)
+
+            first = notebook_support.cached_preprocessed_data(project_dir=project)
+            second = notebook_support.cached_preprocessed_data(project_dir=project)
+
+            self.assertEqual(first["cache_status"], "rebuilt")
+            self.assertEqual(second["cache_status"], "loaded")
+            self.assertTrue((project / "outputs" / "cache" / "train_clean.csv").exists())
 
 
 class DuplicateAndEnsembleTests(unittest.TestCase):
@@ -133,6 +156,38 @@ class OutOfFoldTests(unittest.TestCase):
         np.testing.assert_allclose(oof.sum(axis=1), np.ones(6))
         np.testing.assert_allclose(test_probs.sum(axis=1), np.ones(3))
 
+    def test_make_oof_probabilities_refits_full_train_for_test_by_default(self):
+        from sklearn.base import BaseEstimator, ClassifierMixin
+
+        class FitSizeClassifier(BaseEstimator, ClassifierMixin):
+            def fit(self, X, y):
+                self.classes_ = np.array(sorted(set(y)))
+                self.fit_size_ = len(X)
+                return self
+
+            def predict_proba(self, X):
+                p0 = self.fit_size_ / 10.0
+                return np.tile(np.array([[p0, 1.0 - p0]]), (len(X), 1))
+
+        train = pd.DataFrame(
+            {
+                "Body_clean": ["a0", "a1", "b0", "b1", "a2", "b2"],
+                "Category": [0, 0, 1, 1, 0, 1],
+            }
+        )
+        test = pd.DataFrame({"Body_clean": ["x"]})
+
+        _, test_probs = experimentos.make_oof_probabilities(
+            train,
+            test,
+            FitSizeClassifier(),
+            classes=[0, 1],
+            cv_folds=2,
+            random_state=0,
+        )
+
+        np.testing.assert_allclose(test_probs, np.array([[0.6, 0.4]]))
+
 
 class TransformerTokenizationTests(unittest.TestCase):
     def test_head_tail_tokenization_keeps_beginning_and_ending_tokens(self):
@@ -162,6 +217,32 @@ class TransformerTokenizationTests(unittest.TestCase):
         )
 
         self.assertEqual(encoded["input_ids"], [101, 0, 1, 2, 3, 8, 9, 102])
+
+    def test_head_tail_tokenization_supports_tokenizer_without_prepare_for_model(self):
+        class LegacyBertTokenizer:
+            def __call__(self, text, add_special_tokens=False, truncation=False):
+                return {"input_ids": [int(token[1:]) for token in text.split()]}
+
+            def num_special_tokens_to_add(self, pair=False):
+                return 2
+
+            def build_inputs_with_special_tokens(self, token_ids_0, token_ids_1=None):
+                return [101, *token_ids_0, 102]
+
+            def create_token_type_ids_from_sequences(self, token_ids_0, token_ids_1=None):
+                return [0] * (len(token_ids_0) + 2)
+
+        encoded = experimentos.tokenize_head_tail_text(
+            " ".join(f"t{i}" for i in range(10)),
+            LegacyBertTokenizer(),
+            max_length=8,
+            head_tokens=4,
+            tail_tokens=2,
+        )
+
+        self.assertEqual(encoded["input_ids"], [101, 0, 1, 2, 3, 8, 9, 102])
+        self.assertEqual(encoded["attention_mask"], [1] * 8)
+        self.assertEqual(encoded["token_type_ids"], [0] * 8)
 
 
 class SequentialViterbiTests(unittest.TestCase):

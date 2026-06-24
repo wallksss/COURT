@@ -431,10 +431,17 @@ def make_oof_probabilities(
     cv_folds: int | None = None,
     random_state: int | None = None,
     groups: Sequence[object] | None = None,
+    refit_full_for_test: bool = True,
     output_oof_path: str | Path | None = None,
     output_test_path: str | Path | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Generate leakage-safe out-of-fold and averaged test probabilities."""
+    """Generate leakage-safe OOF probabilities and final test probabilities.
+
+    OOF rows always come from models that did not see those labels. Test
+    probabilities are produced by a full-train refit by default, so final
+    submissions use all available labeled information after validation choices
+    are made. Set ``refit_full_for_test=False`` to average fold models instead.
+    """
 
     _require_sklearn()
     from sklearn.base import clone
@@ -480,7 +487,12 @@ def make_oof_probabilities(
 
     if fold_count == 0:
         raise ValueError("No CV folds were produced.")
-    test_probs /= fold_count
+    if refit_full_for_test:
+        final_estimator = clone(model)
+        final_estimator.fit(X, y)
+        test_probs = _predict_proba_aligned(final_estimator, X_test, class_values)
+    else:
+        test_probs /= fold_count
     oof_probs = _normalize_probabilities(oof_probs)
     test_probs = _normalize_probabilities(test_probs)
 
@@ -1292,6 +1304,18 @@ def transformer_candidate_models() -> pd.DataFrame:
 
     rows = [
         {
+            "model_id": "rufimelo/Legal-BERTimbau-sts-base-ma-v2",
+            "family": "Legal-BERTimbau Base",
+            "why": "Portuguese legal-domain BERTimbau adaptation; safest first legal encoder on 12GB GPUs.",
+            "max_length": 512,
+        },
+        {
+            "model_id": "rufimelo/Legal-BERTimbau-sts-large-ma-v3",
+            "family": "Legal-BERTimbau Large",
+            "why": "Larger legal-domain encoder; useful on 12GB GPUs with small batches or gradient accumulation.",
+            "max_length": 512,
+        },
+        {
             "model_id": "neuralmind/bert-base-portuguese-cased",
             "family": "BERTimbau",
             "why": "Strong Brazilian Portuguese encoder baseline.",
@@ -1426,7 +1450,8 @@ def auto_runtime_profile(prefer_transformer: bool = True) -> dict[str, object]:
         "run_cross_validation": True,
         "run_transformer": run_transformer,
         "run_embeddings": True,
-        "recommended_transformer": "neuralmind/bert-base-portuguese-cased",
+        "recommended_transformer": "rufimelo/Legal-BERTimbau-sts-base-ma-v2",
+        "recommended_large_transformer": "rufimelo/Legal-BERTimbau-sts-large-ma-v3",
         "transformer_batch_size": batch_size,
         "transformer_max_length": max_length,
         "transformer_epochs": 3,
@@ -1719,11 +1744,31 @@ def tokenize_head_tail_text(
         head_count += remaining
         input_ids = input_ids[:head_count] + (input_ids[-tail_count:] if tail_count else [])
 
-    return tokenizer.prepare_for_model(
-        input_ids,
-        truncation=False,
-        max_length=max_length,
-    )
+    if hasattr(tokenizer, "prepare_for_model"):
+        return tokenizer.prepare_for_model(
+            input_ids,
+            truncation=False,
+            max_length=max_length,
+        )
+
+    if hasattr(tokenizer, "build_inputs_with_special_tokens"):
+        encoded_ids = tokenizer.build_inputs_with_special_tokens(input_ids)
+    else:
+        cls_id = getattr(tokenizer, "cls_token_id", None)
+        sep_id = getattr(tokenizer, "sep_token_id", None)
+        encoded_ids = input_ids
+        if cls_id is not None:
+            encoded_ids = [cls_id, *encoded_ids]
+        if sep_id is not None:
+            encoded_ids = [*encoded_ids, sep_id]
+
+    result = {
+        "input_ids": encoded_ids[:max_length],
+        "attention_mask": [1] * min(len(encoded_ids), max_length),
+    }
+    if hasattr(tokenizer, "create_token_type_ids_from_sequences"):
+        result["token_type_ids"] = tokenizer.create_token_type_ids_from_sequences(input_ids)[:max_length]
+    return result
 
 
 def tokenize_head_tail_batch(
@@ -1767,6 +1812,7 @@ def fine_tune_transformer_classifier(
     lora_dropout: float = 0.05,
     lora_target_modules: list[str] | None = None,
     device: str | None = None,
+    validation_size: float | None = None,
 ):
     """Fine-tune a HuggingFace sequence classifier.
 
@@ -1798,12 +1844,17 @@ def fine_tune_transformer_classifier(
     data = train_df[[config.text_col, config.target_col]].rename(columns={config.text_col: "text", config.target_col: "label"})
     label_values, label2id, id2label = build_label_mappings(data["label"])
     data["label"] = data["label"].map(label2id).astype(int)
-    train_split, valid_split = train_test_split(
-        data,
-        test_size=config.validation_size,
-        random_state=config.random_state,
-        stratify=data["label"],
-    )
+    validation_fraction = config.validation_size if validation_size is None else float(validation_size)
+    if validation_fraction > 0:
+        train_split, valid_split = train_test_split(
+            data,
+            test_size=validation_fraction,
+            random_state=config.random_state,
+            stratify=data["label"],
+        )
+    else:
+        train_split = data
+        valid_split = None
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     model_kwargs = {
@@ -1852,7 +1903,11 @@ def fine_tune_transformer_classifier(
         return tokenize_head_tail_batch(batch["text"], tokenizer, max_length=max_length)
 
     train_dataset = Dataset.from_pandas(train_split.reset_index(drop=True)).map(tokenize, batched=True)
-    valid_dataset = Dataset.from_pandas(valid_split.reset_index(drop=True)).map(tokenize, batched=True)
+    valid_dataset = (
+        Dataset.from_pandas(valid_split.reset_index(drop=True)).map(tokenize, batched=True)
+        if valid_split is not None
+        else None
+    )
     def compute_metrics(eval_pred):
         logits, labels = eval_pred
         preds = np.argmax(logits, axis=-1)
@@ -1899,13 +1954,14 @@ def fine_tune_transformer_classifier(
         "save_strategy": "epoch",
         "logging_steps": 50,
         "save_total_limit": 2,
-        "load_best_model_at_end": True,
-        "metric_for_best_model": "f1_macro",
-        "greater_is_better": True,
+        "load_best_model_at_end": valid_dataset is not None,
         "report_to": "none",
         "fp16": bool(device == "cuda" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported()),
         "bf16": bool(device == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported()),
     }
+    if valid_dataset is not None:
+        args_kwargs["metric_for_best_model"] = "f1_macro"
+        args_kwargs["greater_is_better"] = True
     # if device == "cpu":
     #     args_kwargs["use_cpu"] = True
     # elif device == "mps":
@@ -1933,20 +1989,22 @@ def fine_tune_transformer_classifier(
     filtered_args = {k: v for k, v in args_kwargs.items() if k in valid_params}
 
     # Trata de forma inteligente a mudança de 'evaluation_strategy' para 'eval_strategy'
+    eval_strategy_value = "epoch" if valid_dataset is not None else "no"
     if "eval_strategy" in valid_params:
-        args = TrainingArguments(eval_strategy="epoch", **filtered_args)
+        args = TrainingArguments(eval_strategy=eval_strategy_value, **filtered_args)
     else:
-        args = TrainingArguments(evaluation_strategy="epoch", **filtered_args)
+        args = TrainingArguments(evaluation_strategy=eval_strategy_value, **filtered_args)
     # =========================================================================
 
     trainer_kwargs = {
         "model": model,
         "args": args,
         "train_dataset": train_dataset,
-        "eval_dataset": valid_dataset,
         "data_collator": DataCollatorWithPadding(tokenizer=tokenizer),
         "compute_metrics": compute_metrics,
     }
+    if valid_dataset is not None:
+        trainer_kwargs["eval_dataset"] = valid_dataset
     if use_class_weights:
         trainer = _instantiate_trainer_compat(
             WeightedTrainer,
@@ -1961,6 +2019,34 @@ def fine_tune_transformer_classifier(
             tokenizer=tokenizer,
         )
     trainer.train()
+    return trainer
+
+
+def load_transformer_trainer(
+    model_dir: str | Path,
+    device: str | None = None,
+):
+    """Load a saved HuggingFace sequence classifier as a Trainer."""
+
+    try:
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer, DataCollatorWithPadding, Trainer
+    except ImportError as exc:
+        raise ImportError("Install transformers and torch to load transformer trainers.") from exc
+
+    import torch
+
+    model_dir = Path(model_dir)
+    if not model_dir.exists():
+        raise FileNotFoundError(f"Transformer model directory not found: {model_dir}")
+    device = device or gpu_environment_report().get("preferred_device", "cpu")
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
+    model = AutoModelForSequenceClassification.from_pretrained(model_dir)
+    model.to(torch.device(device))
+    trainer = Trainer(
+        model=model,
+        data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
+    )
+    trainer.processing_class = tokenizer
     return trainer
 
 
