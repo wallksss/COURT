@@ -116,7 +116,19 @@ The notebook now includes an explicit CSV-only competition path:
 
 The validation code avoids deliberate leakage: duplicate priors for training rows are built out-of-fold, and the sequential Viterbi lambda is selected by hiding labels inside the training set. After those choices are made, test probabilities are generated with a final refit on all labeled training rows by default.
 
-For Transformer experiments, the default legal-domain checkpoint is `rufimelo/Legal-BERTimbau-sts-base-ma-v2`. On a 12GB GPU, start with this base model; `rufimelo/Legal-BERTimbau-sts-large-ma-v3` is listed as a stronger but tighter option that should use smaller batches.
+For Transformer experiments, the default portable checkpoint is `rufimelo/Legal-BERTimbau-sts-base-ma-v2`. On a 12GB GPU, start with this base model; `rufimelo/Legal-BERTimbau-sts-large-ma-v3` is listed as a stronger but tighter option that should use smaller batches.
+
+## Best-Effort RTX 5000 Path
+
+The final notebook section, `Seção extra: Best effort RTX 5000 32 GB`, is intentionally isolated and can be run after a fresh kernel restart. It reloads or rebuilds the preprocessing cache, trains `rufimelo/Legal-BERTimbau-sts-large-ma-v3` with gradient accumulation and checkpointing, refits the final model on all available training rows, and writes:
+
+- `outputs/model_results_best_effort.csv`
+- `outputs/submission_best_effort_transformer.csv`
+- `outputs/submission_best_effort_viterbi.csv`
+- `outputs/submission_best_effort.csv`
+- `outputs/best_effort_metadata.json`
+
+This path also keeps `Tropic-AI/moBERTo` documented as an optional long-context ablation, but the default prioritizes the Portuguese legal-domain checkpoint plus Viterbi/HMM post-processing in `Id` order.
 
 ## Notes On Sensitive Data
 

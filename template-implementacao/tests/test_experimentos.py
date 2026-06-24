@@ -244,6 +244,59 @@ class TransformerTokenizationTests(unittest.TestCase):
         self.assertEqual(encoded["attention_mask"], [1] * 8)
         self.assertEqual(encoded["token_type_ids"], [0] * 8)
 
+    def test_head_tail_default_scales_with_window_size(self):
+        class FakeTokenizer:
+            def __call__(self, text, add_special_tokens=False, truncation=False):
+                return {"input_ids": list(range(20))}
+
+            def num_special_tokens_to_add(self, pair=False):
+                return 2
+
+            def prepare_for_model(self, input_ids, truncation=False, max_length=None):
+                return {"input_ids": [101, *input_ids, 102], "attention_mask": [1] * (len(input_ids) + 2)}
+
+        encoded = experimentos.tokenize_head_tail_text("texto longo", FakeTokenizer(), max_length=12)
+
+        self.assertEqual(encoded["input_ids"], [101, 0, 1, 2, 3, 4, 5, 6, 7, 18, 19, 102])
+
+    def test_predict_transformer_probabilities_returns_probs_and_original_labels(self):
+        class FakeTokenizer:
+            def __call__(self, text, add_special_tokens=False, truncation=False):
+                return {"input_ids": [1, 2, 3]}
+
+            def num_special_tokens_to_add(self, pair=False):
+                return 2
+
+            def prepare_for_model(self, input_ids, truncation=False, max_length=None):
+                return {"input_ids": [101, *input_ids, 102], "attention_mask": [1] * (len(input_ids) + 2)}
+
+        class FakeConfig:
+            id2label = {0: "2", 1: "4"}
+
+        class FakeModel:
+            config = FakeConfig()
+
+        class FakePrediction:
+            predictions = np.array([[0.0, 2.0], [2.0, 0.0]])
+
+        class FakeTrainer:
+            model = FakeModel()
+            processing_class = FakeTokenizer()
+
+            def predict(self, dataset):
+                return FakePrediction()
+
+        probs, labels = experimentos.predict_transformer_probabilities(
+            FakeTrainer(),
+            pd.DataFrame({"Body_clean": ["a", "b"]}),
+            text_col="Body_clean",
+            max_length=8,
+        )
+
+        self.assertEqual(labels, [2, 4])
+        self.assertEqual(probs.shape, (2, 2))
+        np.testing.assert_allclose(probs.sum(axis=1), np.ones(2))
+
 
 class SequentialViterbiTests(unittest.TestCase):
     def test_viterbi_keeps_known_labels_fixed(self):

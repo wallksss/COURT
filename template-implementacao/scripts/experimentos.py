@@ -1312,8 +1312,14 @@ def transformer_candidate_models() -> pd.DataFrame:
         {
             "model_id": "rufimelo/Legal-BERTimbau-sts-large-ma-v3",
             "family": "Legal-BERTimbau Large",
-            "why": "Larger legal-domain encoder; useful on 12GB GPUs with small batches or gradient accumulation.",
+            "why": "Best-effort legal-domain encoder for stronger GPUs; tuned from Legal-BERTimbau large.",
             "max_length": 512,
+        },
+        {
+            "model_id": "Tropic-AI/moBERTo",
+            "family": "moBERTo",
+            "why": "ModernBERT-style Portuguese encoder with long-context support; useful as a 2048/4096-token ablation.",
+            "max_length": 8192,
         },
         {
             "model_id": "neuralmind/bert-base-portuguese-cased",
@@ -1720,14 +1726,14 @@ def tokenize_head_tail_text(
     text: object,
     tokenizer,
     max_length: int = 512,
-    head_tokens: int = 384,
-    tail_tokens: int = 128,
+    head_tokens: int | None = None,
+    tail_tokens: int | None = None,
 ) -> dict[str, list[int]]:
     """Tokenize one document with first-token plus last-token truncation."""
 
     if max_length <= 0:
         raise ValueError("max_length must be positive.")
-    if head_tokens < 0 or tail_tokens < 0:
+    if (head_tokens is not None and head_tokens < 0) or (tail_tokens is not None and tail_tokens < 0):
         raise ValueError("head_tokens and tail_tokens must be non-negative.")
 
     encoded = tokenizer(str(text or ""), add_special_tokens=False, truncation=False)
@@ -1738,10 +1744,20 @@ def tokenize_head_tail_text(
         special_count = 2
     content_length = max(max_length - special_count, 1)
     if len(input_ids) > content_length:
-        tail_count = min(tail_tokens, content_length)
-        head_count = min(head_tokens, content_length - tail_count)
-        remaining = content_length - head_count - tail_count
-        head_count += remaining
+        if head_tokens is None and tail_tokens is None:
+            tail_count = max(1, content_length // 4) if content_length > 1 else 0
+            head_count = content_length - tail_count
+        elif head_tokens is None:
+            tail_count = min(int(tail_tokens or 0), content_length)
+            head_count = content_length - tail_count
+        elif tail_tokens is None:
+            head_count = min(int(head_tokens), content_length)
+            tail_count = content_length - head_count
+        else:
+            tail_count = min(int(tail_tokens), content_length)
+            head_count = min(int(head_tokens), content_length - tail_count)
+            remaining = content_length - head_count - tail_count
+            head_count += remaining
         input_ids = input_ids[:head_count] + (input_ids[-tail_count:] if tail_count else [])
 
     if hasattr(tokenizer, "prepare_for_model"):
@@ -1775,8 +1791,8 @@ def tokenize_head_tail_batch(
     texts: Iterable[object],
     tokenizer,
     max_length: int = 512,
-    head_tokens: int = 384,
-    tail_tokens: int = 128,
+    head_tokens: int | None = None,
+    tail_tokens: int | None = None,
 ) -> dict[str, list[list[int]]]:
     """Tokenize a batch using head+tail truncation without padding."""
 
@@ -1801,9 +1817,13 @@ def fine_tune_transformer_classifier(
     num_train_epochs: float = 3.0,
     learning_rate: float = 2e-5,
     per_device_train_batch_size: int = 8,
+    gradient_accumulation_steps: int = 1,
     max_length: int = 512,
     output_dir: str = "outputs/transformer",
     weight_decay: float = 0.01,
+    warmup_ratio: float = 0.0,
+    lr_scheduler_type: str = "linear",
+    gradient_checkpointing: bool = False,
     use_class_weights: bool = True,
     use_lora: bool = False,
     quantization_4bit: bool = False,
@@ -1878,6 +1898,10 @@ def fine_tune_transformer_classifier(
         model_kwargs["device_map"] = "auto"
 
     model = AutoModelForSequenceClassification.from_pretrained(model_name, **model_kwargs)
+    if gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        if hasattr(model, "config"):
+            model.config.use_cache = False
 
     if use_lora:
         try:
@@ -1949,8 +1973,12 @@ def fine_tune_transformer_classifier(
         "learning_rate": learning_rate,
         "per_device_train_batch_size": per_device_train_batch_size,
         "per_device_eval_batch_size": per_device_train_batch_size,
+        "gradient_accumulation_steps": max(1, int(gradient_accumulation_steps)),
         "num_train_epochs": num_train_epochs,
         "weight_decay": weight_decay,
+        "warmup_ratio": warmup_ratio,
+        "lr_scheduler_type": lr_scheduler_type,
+        "gradient_checkpointing": gradient_checkpointing,
         "save_strategy": "epoch",
         "logging_steps": 50,
         "save_total_limit": 2,
@@ -2050,6 +2078,62 @@ def load_transformer_trainer(
     return trainer
 
 
+def _label_values_from_trainer(trainer, n_outputs: int) -> list[object]:
+    """Recover original class labels from a HuggingFace Trainer."""
+
+    config = getattr(getattr(trainer, "model", None), "config", None)
+    id2label = getattr(config, "id2label", None) if config is not None else None
+    if not id2label:
+        return list(range(n_outputs))
+
+    label_values: list[object] = []
+    for idx in range(n_outputs):
+        raw_label = id2label.get(idx, id2label.get(str(idx), idx))
+        try:
+            raw_label = int(raw_label)
+        except (TypeError, ValueError):
+            pass
+        label_values.append(raw_label)
+    return label_values
+
+
+def predict_transformer_probabilities(
+    trainer,
+    test_df: pd.DataFrame,
+    tokenizer=None,
+    text_col: str = "Body_clean",
+    max_length: int = 512,
+) -> tuple[np.ndarray, list[object]]:
+    """Return Transformer class probabilities and the matching original labels."""
+
+    try:
+        from datasets import Dataset
+    except ImportError as exc:
+        raise ImportError("Install datasets to generate transformer probabilities.") from exc
+
+    if text_col not in test_df.columns:
+        raise KeyError(f"Column '{text_col}' not found in test_df.")
+
+    tokenizer = tokenizer or getattr(trainer, "processing_class", None) or getattr(trainer, "tokenizer", None)
+    if tokenizer is None:
+        raise ValueError("A tokenizer or trainer.processing_class is required.")
+
+    dataset = Dataset.from_pandas(test_df[[text_col]].rename(columns={text_col: "text"}).reset_index(drop=True))
+
+    def tokenize(batch):
+        return tokenize_head_tail_batch(batch["text"], tokenizer, max_length=max_length)
+
+    tokenized = dataset.map(tokenize, batched=True)
+    removable_columns = [column for column in ("text", "__index_level_0__") if column in tokenized.column_names]
+    if removable_columns:
+        tokenized = tokenized.remove_columns(removable_columns)
+    raw_predictions = trainer.predict(tokenized).predictions
+    if isinstance(raw_predictions, tuple):
+        raw_predictions = raw_predictions[0]
+    probabilities = _softmax(np.asarray(raw_predictions, dtype=float))
+    return probabilities, _label_values_from_trainer(trainer, probabilities.shape[1])
+
+
 def generate_transformer_submission(
     trainer,
     test_df: pd.DataFrame,
@@ -2061,34 +2145,20 @@ def generate_transformer_submission(
 ) -> pd.DataFrame:
     """Generate a Kaggle submission with a fine-tuned HuggingFace Trainer."""
 
-    try:
-        from datasets import Dataset
-    except ImportError as exc:
-        raise ImportError("Install datasets to generate transformer submissions.") from exc
-
     if text_col not in test_df.columns:
         raise KeyError(f"Column '{text_col}' not found in test_df.")
     if id_col not in test_df.columns:
         raise KeyError(f"Column '{id_col}' not found in test_df.")
 
-    tokenizer = tokenizer or getattr(trainer, "processing_class", None) or getattr(trainer, "tokenizer", None)
-    if tokenizer is None:
-        raise ValueError("A tokenizer or trainer.processing_class is required.")
-
-    dataset = Dataset.from_pandas(test_df[[id_col, text_col]].rename(columns={text_col: "text"}).reset_index(drop=True))
-
-    def tokenize(batch):
-        return tokenize_head_tail_batch(batch["text"], tokenizer, max_length=max_length)
-
-    tokenized = dataset.map(tokenize, batched=True)
-    predictions = trainer.predict(tokenized)
-    predicted_ids = np.argmax(predictions.predictions, axis=-1).astype(int)
-    id2label = getattr(getattr(trainer, "model", None), "config", None)
-    id2label = getattr(id2label, "id2label", None) if id2label is not None else None
-    if id2label:
-        labels = np.asarray([int(id2label.get(int(idx), id2label.get(str(idx), idx))) for idx in predicted_ids], dtype=int)
-    else:
-        labels = predicted_ids
+    probabilities, label_values = predict_transformer_probabilities(
+        trainer,
+        test_df,
+        tokenizer=tokenizer,
+        text_col=text_col,
+        max_length=max_length,
+    )
+    predicted_ids = np.argmax(probabilities, axis=-1).astype(int)
+    labels = np.asarray(label_values, dtype=object)[predicted_ids]
     submission = pd.DataFrame({"Id": test_df[id_col].values, "Category": labels})
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

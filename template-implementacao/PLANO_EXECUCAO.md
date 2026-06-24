@@ -33,7 +33,7 @@ O repositorio `loren-gc/SDUWPS-ML-Classifier` separa a implementacao em `IMPLEME
 
 8. Representacao densa e Transformers:
    `auto_runtime_profile` detecta CPU, CUDA/NVIDIA ou Apple MPS e ajusta batch, precisao e dispositivo sem exigir flags manuais. O pipeline completo continua sendo executado; em CPU ele apenas fica mais lento. `build_chunked_sentence_embedding_matrix` divide documentos longos em chunks sobrepostos antes de gerar embeddings com SentenceTransformers, reduzindo truncamento. `fine_tune_transformer_classifier` isola o fine-tuning com HuggingFace para modelos como BERTimbau, Albertina, ModernBERT e Longformer.
-   O fine-tuning agora usa truncamento `head+tail` para manter o inicio e o final dos documentos em janelas de 512 tokens. A prioridade padrao e Legal-BERTimbau base (`rufimelo/Legal-BERTimbau-sts-base-ma-v2`), com Legal-BERTimbau large (`rufimelo/Legal-BERTimbau-sts-large-ma-v3`) como alternativa mais pesada.
+   O fine-tuning agora usa truncamento `head+tail` para manter o inicio e o final dos documentos. Quando `max_length` aumenta, a divisao escala automaticamente em vez de manter uma janela fixa de 512 tokens. A prioridade padrao portavel e Legal-BERTimbau base (`rufimelo/Legal-BERTimbau-sts-base-ma-v2`), com Legal-BERTimbau large (`rufimelo/Legal-BERTimbau-sts-large-ma-v3`) como alternativa mais forte.
 
 9. Auditoria de rotulos e pseudo-rotulagem:
    `detect_label_issues_with_cv` procura possiveis rotulos incorretos com predicoes fora da dobra. `pseudo_label_unlabeled_samples` reaproveita amostras com `Category = -1` apenas quando a confianca do modelo e alta. `build_training_set_with_pseudo_labels` combina rotulos originais, pseudo-rotulos e correcoes conservadoras mantendo rastreabilidade.
@@ -43,6 +43,9 @@ O repositorio `loren-gc/SDUWPS-ML-Classifier` separa a implementacao em `IMPLEME
 
 11. Submissao:
    `generate_submission` treina o melhor modelo em todo o treino, prediz `test.csv` e salva `outputs/submission.csv` com colunas `Id,Category`. A nova rota CSV-only salva `outputs/submission_sota_csv_viterbi.csv`, que aplica ensemble, prior por duplicata e Viterbi transdutivo sem acessar rotulos de teste.
+
+12. Best effort em GPU forte:
+   A secao extra final do notebook roda de forma independente das anteriores. Ela foi calibrada para RTX 5000 Ada de 32 GB e usa `rufimelo/Legal-BERTimbau-sts-large-ma-v3`, `gradient_accumulation_steps`, `warmup_ratio`, `gradient_checkpointing` e treino final sem validacao para gerar `outputs/submission_best_effort.csv`. A justificativa combina modelo juridico em portugues com pos-processamento sequencial por `Id`, inspirado na literatura do VICTOR/STF. `Tropic-AI/moBERTo` fica documentado como ablação de contexto longo, mas nao e o padrao inicial porque o dominio juridico tende a ser mais decisivo neste teste.
 
 ## Experimentos recomendados
 
@@ -64,10 +67,13 @@ O repositorio `loren-gc/SDUWPS-ML-Classifier` separa a implementacao em `IMPLEME
 6. Transformer:
    Fine-tuning de BERTimbau/Albertina para textos truncados em 512 tokens. Quando houver CUDA, o treino usa GPU NVIDIA; quando houver Apple Silicon, usa MPS; quando nenhum acelerador estiver disponivel, usa CPU com batch menor. Assim o mesmo notebook roda sem flags em qualquer maquina.
 
-7. Ajuste eficiente:
+7. Best effort RTX 5000:
+   Executar a secao extra final. Ela valida Legal-BERTimbau Large, salva metricas e retreina o modelo final usando todos os dados disponiveis antes da submissao. A saida principal e `outputs/submission_best_effort.csv`; a saida `submission_best_effort_transformer.csv` guarda o argmax puro para comparacao com o Viterbi.
+
+8. Ajuste eficiente:
    Quando houver GPU, testar PEFT/LoRA/QLoRA para reduzir custo, principalmente se um encoder/LLM maior for usado.
 
-8. Dados sem rotulo e rotulos ruidosos:
+9. Dados sem rotulo e rotulos ruidosos:
    Usar pseudo-rotulagem com limiar conservador para `Category = -1` e salvar uma auditoria dos possiveis erros de rotulagem. A correcao automatica deve ficar restrita a casos de confianca muito alta, mantendo os arquivos de auditoria para revisao manual.
 
 ## Referencias consultadas
@@ -81,3 +87,7 @@ O repositorio `loren-gc/SDUWPS-ML-Classifier` separa a implementacao em `IMPLEME
 - QLoRA: https://arxiv.org/abs/2305.14314
 - ModernBERT: https://arxiv.org/abs/2412.13663
 - NorBERTo / ModernBERT em portugues: https://arxiv.org/abs/2605.00086
+- VICTOR/STF com modelagem sequencial: https://arxiv.org/abs/2207.00748
+- LegalBench-BR e fine-tuning juridico brasileiro: https://arxiv.org/abs/2604.18878
+- Legal-BERTimbau Large: https://huggingface.co/rufimelo/Legal-BERTimbau-sts-large-ma-v3
+- moBERTo / ModernBERT em portugues com contexto longo: https://arxiv.org/abs/2606.22722
