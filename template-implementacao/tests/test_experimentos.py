@@ -322,6 +322,41 @@ class SequentialViterbiTests(unittest.TestCase):
 
         self.assertEqual(decoded[1], 1)
 
+    def test_transductive_viterbi_submission_preserves_original_test_order(self):
+        config = experimentos.ExperimentConfig(text_col="Body_clean", target_col="Category", id_col="Id")
+        train = pd.DataFrame(
+            {
+                "Id": [1, 2],
+                "Body_clean": ["treino um", "treino dois"],
+                "Category": [0, 1],
+            }
+        )
+        test = pd.DataFrame(
+            {
+                "Id": [30, 10, 20],
+                "Body_clean": ["teste trinta", "teste dez", "teste vinte"],
+            }
+        )
+        probs = np.array(
+            [
+                [0.10, 0.90],
+                [0.95, 0.05],
+                [0.20, 0.80],
+            ]
+        )
+
+        submission = experimentos.transductive_viterbi_submission(
+            train,
+            test,
+            probs,
+            classes=[0, 1],
+            config=config,
+            lambda_transition=0.0,
+        )
+
+        self.assertEqual(submission["Id"].tolist(), [30, 10, 20])
+        self.assertEqual(submission["Category"].tolist(), [1, 0, 1])
+
 
 class TrainerCompatibilityTests(unittest.TestCase):
     def test_legacy_trainer_does_not_receive_tokenizer_keyword(self):
@@ -341,6 +376,14 @@ class TrainerCompatibilityTests(unittest.TestCase):
 
         self.assertIs(trainer.processing_class, tokenizer)
         self.assertNotIn("tokenizer", trainer.kwargs)
+
+    def test_num_labels_from_logits_does_not_require_model_config(self):
+        class DataParallelLike:
+            pass
+
+        logits = np.zeros((4, 5))
+
+        self.assertEqual(experimentos._num_labels_from_logits(DataParallelLike(), logits), 5)
 
     def test_new_trainer_receives_processing_class_when_supported(self):
         tokenizer = object()

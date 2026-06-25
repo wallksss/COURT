@@ -872,6 +872,7 @@ def transductive_viterbi_submission(
             config.id_col: test_df[config.id_col].to_numpy(),
             "_source": "test",
             "_row": np.arange(len(test_df)),
+            "_test_order": np.arange(len(test_df)),
         }
     )
     all_data = pd.concat([train_part, test_part], ignore_index=True).sort_values(config.id_col).reset_index(drop=True)
@@ -897,8 +898,9 @@ def transductive_viterbi_submission(
     )
     all_data["Category"] = class_values[np.asarray(decoded_indices)].astype(int)
     submission = (
-        all_data.loc[all_data["_source"] == "test", [config.id_col, "Category"]]
-        .sort_values(config.id_col)
+        all_data.loc[all_data["_source"] == "test", [config.id_col, "Category", "_test_order"]]
+        .sort_values("_test_order")
+        .drop(columns="_test_order")
         .reset_index(drop=True)
     )
     if output_path is not None:
@@ -1959,7 +1961,7 @@ def fine_tune_transformer_classifier(
                 loss_fct = torch.nn.CrossEntropyLoss(weight=self.class_weights.to(logits.device))
             else:
                 loss_fct = torch.nn.CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, model.config.num_labels), labels.view(-1))
+            loss = loss_fct(logits.view(-1, _num_labels_from_logits(model, logits)), labels.view(-1))
             return (loss, outputs) if return_outputs else loss
 
     class_weights = None
@@ -2076,6 +2078,18 @@ def load_transformer_trainer(
     )
     trainer.processing_class = tokenizer
     return trainer
+
+
+def _num_labels_from_logits(model, logits) -> int:
+    """Return class count without assuming the model exposes config directly."""
+
+    shape = getattr(logits, "shape", None)
+    if shape is not None and len(shape) > 0:
+        return int(shape[-1])
+    config = getattr(model, "config", None) or getattr(getattr(model, "module", None), "config", None)
+    if config is not None and getattr(config, "num_labels", None) is not None:
+        return int(config.num_labels)
+    raise AttributeError("Could not infer num_labels from logits shape or model config.")
 
 
 def _label_values_from_trainer(trainer, n_outputs: int) -> list[object]:
