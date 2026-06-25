@@ -161,6 +161,37 @@ def normalize_whitespace(text: str) -> str:
     return text.strip()
 
 
+def fix_mojibake(text: object) -> str:
+    """Repair common latin1/utf-8 mojibake without changing clean text."""
+
+    if pd.isna(text):
+        return ""
+    value = str(text)
+    if any(marker in value for marker in ("Ã", "Â", "â")):
+        try:
+            return value.encode("latin1").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            return value
+    return value
+
+
+def clean_body(text: object) -> str:
+    """Minimal competition cleaner that preserves legal/artificial tokens.
+
+    This cleaner follows the CSV-only plan: fix encoding, remove the occasional
+    ``{"texto"}`` wrapper, and normalize whitespace. It deliberately avoids
+    lowercasing, stemming, stopword removal and accent stripping.
+    """
+
+    if pd.isna(text):
+        return ""
+    cleaned = str(text).strip()
+    if cleaned.startswith('{"') and cleaned.endswith('"}'):
+        cleaned = cleaned[2:-2]
+    cleaned = fix_mojibake(cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def fix_ocr_artifacts(text: str) -> str:
     """Reduce common OCR artifacts without deleting useful legal content."""
 
@@ -218,7 +249,7 @@ def clean_text(text: object, config: TextPreprocessConfig | None = None) -> str:
     if pd.isna(text):
         return ""
 
-    cleaned = str(text)
+    cleaned = clean_body(text)
     cleaned = fix_ocr_artifacts(cleaned)
 
     if config.remove_urls_emails:
@@ -267,6 +298,20 @@ def add_clean_text_column(
         raise KeyError(f"Column '{text_col}' not found.")
     result = df.copy()
     result[output_col] = preprocess_corpus(result[text_col], config=config).values
+    return result
+
+
+def add_clean_body_column(
+    df: pd.DataFrame,
+    text_col: str = "Body",
+    output_col: str = "clean_body",
+) -> pd.DataFrame:
+    """Return a copy with the leakage-safe minimal ``clean_body`` column."""
+
+    if text_col not in df.columns:
+        raise KeyError(f"Column '{text_col}' not found.")
+    result = df.copy()
+    result[output_col] = result[text_col].map(clean_body)
     return result
 
 
