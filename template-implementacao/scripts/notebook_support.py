@@ -6,8 +6,8 @@
 # Disciplina: Processamento de Linguagem Natural
 # Prof. Tiago A. Almeida
 #
-# Nome:
-# RA:
+# Aluno: Anderson Cristiano Sassaki Gonçalves e Lorenzo Grippo Chiachio
+# RA: 821675 e 823917
 # ################################################################
 
 """Notebook orchestration helpers with lightweight file caching."""
